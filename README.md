@@ -1,5 +1,26 @@
 # Day 11 — Controlled Agent Security (2026)
 
+## Thông tin học viên
+
+- **Họ tên:** Võ Hồng Lương
+- **MSSV:** 2A202603839
+- **Lớp:** K5-L3B · Day 11 — Guardrails / HITL / Responsible AI
+
+### Cách chạy (từ gốc repo, sau khi kích hoạt `.venv` và điền `.env`)
+
+```powershell
+python -m pip install -r requirements.txt
+python src/main.py --part 2        # Checkpoint 2: input/output guardrails (không cần API)
+python src/main.py --part 3        # Checkpoint 3: pipeline -> outputs/results.json, audit_log.json, metrics.json
+python src/main.py --part 4        # Checkpoint 4: tấn công Red + Red Advance -> outputs/attack_results.json
+python -m pytest tests/smoke tests/public -q
+python scripts/grade.py --submission-dir . --out outputs/grade_report.json
+```
+
+> Phần dưới đây là README gốc của bài lab (giữ nguyên).
+
+---
+
 > 👤 **Hình thức:** bài tập **cá nhân** (1 người / 1 MSSV).  
 > 🎯 **Mục tiêu:** đóng vai **Blue Team** để học cách xây Guardrails phòng thủ, rồi đóng vai **Red Team** để tấn công agent **Red** hoặc **Red Advance**.  
 > ✅ Làm theo **Checkpoint 1 → 5** trong [`CHECKPOINTS.md`](CHECKPOINTS.md) · nộp theo [`SUBMISSION.md`](SUBMISSION.md).
