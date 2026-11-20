@@ -58,6 +58,17 @@ def _normalize(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
+# Leetspeak substitutions. "1" is ambiguous (i in "d1sregard", l in "ru1es"), so it
+# yields two views; everything else maps one way.
+_LEET_COMMON = {"0": "o", "3": "e", "4": "a", "5": "s", "7": "t", "@": "a", "$": "s", "!": "i"}
+
+
+def _leet_views(text: str) -> tuple[str, str]:
+    """Return ``text`` with leetspeak undone, once with 1->i and once with 1->l."""
+    base = text.translate(str.maketrans(_LEET_COMMON))
+    return base.replace("1", "i"), base.replace("1", "l")
+
+
 # Each pattern targets an attacker *instruction*, not a topic, so an ordinary
 # "summarise this transfer email" request does not match any of them.
 INJECTION_PATTERNS = [
@@ -102,9 +113,13 @@ def detect_injection(user_input: str) -> InputStatus:
     """
     text = _normalize(user_input)
 
-    for pattern in INJECTION_PATTERNS:
-        if pattern.search(text):
-            return "BLOCK"
+    # Check the text as written AND with leetspeak undone ("Ign0re", "d1sregard").
+    # The original view is kept so legitimate digits (amounts, account numbers) are
+    # still judged exactly as typed.
+    for view in (text, *_leet_views(text)):
+        for pattern in INJECTION_PATTERNS:
+            if pattern.search(view):
+                return "BLOCK"
     return "ALLOW"
 
 
