@@ -12,6 +12,7 @@ from google.adk.agents import llm_agent
 from google.adk import runners
 from google.adk.plugins import base_plugin
 
+from core.config import DEMO_SECRETS
 from core.utils import chat_with_agent
 
 
@@ -41,16 +42,36 @@ def content_filter(response: str) -> dict:
 
     # PII patterns to check
     PII_PATTERNS = {
-        # TODO: Add regex patterns for:
-        # - VN phone number: r"0\d{9,10}"
-        # - Email: r"[\w.-]+@[\w.-]+\.[a-zA-Z]{2,}"
-        # - National ID (CMND/CCCD): r"\b\d{9}\b|\b\d{12}\b"
-        # - API key pattern: r"sk-[a-zA-Z0-9-]+"
-        # - Password pattern: r"password\s*[:=]\s*\S+"
+        # VN phone, 10-11 digits starting with 0. \b on BOTH sides stops it from
+        # biting the first 11 digits of a 12-digit CCCD.
+        # Also +84 and spaced/dotted/dashed forms ("0912 345 678", "+84 912.345.678").
+        # (?!\d) after the digits still keeps a 12-digit CCCD from being read as a phone.
+        "phone": r"(?<![\w+])(?:\+84|0)(?:[\s.-]?\d){9,10}(?!\d)",
+        # Email, except the bank's own public support address (a legit answer).
+        "email": r"\b(?!support@vinbank\.example\b)[\w.+-]+@[\w-]+(?:\.[\w-]+)*\.[a-zA-Z]{2,}\b",
+        # CMND (9 digits) / CCCD (12 digits). Not when it is a money amount ("500000000 VND").
+        "national_id": r"\b(?:\d{9}|\d{12})\b(?!\s*(?:vnd|usd|dong|đ)\b)",
+        # API keys such as sk-vinbank-secret-2024 / sk-demo-key-abc123
+        "api_key": r"\bsk-[a-zA-Z0-9-]+",
+        # "password: x", "password=x", "password is x" (also Vietnamese "mật khẩu").
+        # Stops before , ; and a trailing "." so the sentence punctuation survives.
+        "password": r"(?:password|mật\s*khẩu)\s*(?:[:=]|is|là)\s*[^\s,;]*[^\s,;.]",
+        # The lab's own secrets, even without a "password" label (e.g. "the host is db.vinbank.internal").
+        # Each character may be followed by separators, so "a d m i n 1 2 3" or
+        # "admin-123" are caught too.
+        "internal_secret": (
+            "(?:"
+            + "|".join(r"[\W_]*".join(re.escape(c) for c in s if c.isalnum() or c in ".-") for s in DEMO_SECRETS)
+            + r")(?::\d+)?"
+            if DEMO_SECRETS
+            else r"(?!x)x"  # never matches if the secrets file is missing
+        ),
     }
 
     for name, pattern in PII_PATTERNS.items():
-        matches = re.findall(pattern, response, re.IGNORECASE)
+        # Count on the text as redacted so far: a value already masked by an earlier
+        # pattern (e.g. admin123 inside "password is admin123") is not reported twice.
+        matches = re.findall(pattern, redacted, re.IGNORECASE)
         if matches:
             issues.append(f"{name}: {len(matches)} found")
             redacted = re.sub(pattern, "[REDACTED]", redacted, flags=re.IGNORECASE)
@@ -159,6 +180,11 @@ class OutputGuardrailPlugin(base_plugin.BasePlugin):
                     text += part.text
         return text
 
+    @staticmethod
+    def _make_content(text: str) -> types.Content:
+        """Wrap plain text as a model reply."""
+        return types.Content(role="model", parts=[types.Part.from_text(text=text)])
+
     async def after_model_callback(
         self,
         *,
@@ -172,16 +198,25 @@ class OutputGuardrailPlugin(base_plugin.BasePlugin):
         if not response_text:
             return llm_response
 
-        # TODO: Implement logic:
-        # 1. Call content_filter(response_text)
-        #    - If issues found: replace llm_response.content with redacted version
-        #    - Increment self.redacted_count
-        # 2. If use_llm_judge: call llm_safety_check(response_text)
-        #    - If unsafe: replace llm_response.content with a safe message
-        #    - Increment self.blocked_count
-        # 3. Return llm_response (possibly modified)
+        # 1. Deterministic filter: mask PII / secrets but keep the useful answer.
+        result = content_filter(response_text)
+        if not result["safe"]:
+            self.redacted_count += 1
+            response_text = result["redacted"]
+            llm_response.content = self._make_content(response_text)
 
-        return llm_response  # TODO: modify if needed
+        # 2. Optional LLM judge (off unless safety_judge_agent is configured).
+        #    Runs on the already-redacted text so the judge never sees raw secrets.
+        if self.use_llm_judge:
+            verdict = await llm_safety_check(response_text)
+            if not verdict["safe"]:
+                self.blocked_count += 1
+                llm_response.content = self._make_content(
+                    "Sorry, I can't share that. I can help with VinBank banking questions."
+                )
+
+        # 3. Return the (possibly modified) response.
+        return llm_response
 
 
 # ============================================================

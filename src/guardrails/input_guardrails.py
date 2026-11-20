@@ -11,6 +11,7 @@ Status convention (không dùng True/False mơ hồ):
 from __future__ import annotations
 
 import re
+import unicodedata
 from typing import Literal
 
 from google.genai import types
@@ -42,6 +43,54 @@ InputStatus = Literal["ALLOW", "BLOCK"]
 # Regex is one signal, not the whole security boundary.
 # ============================================================
 
+_INVISIBLE = "​‌‍⁠﻿­"  # zero-width + soft hyphen
+
+
+def _normalize(text: str) -> str:
+    """Canonicalize so disguised text matches the regexes.
+
+    - NFKC folds look-alikes (full-width "Ｉgnore", ligatures) to plain ASCII.
+    - Invisible chars are *deleted*, so ``Ig\\u200bnore`` becomes ``Ignore``.
+    - Any run of whitespace collapses to one space, so ``ignore   all\\n\\tprevious`` matches.
+    """
+    text = unicodedata.normalize("NFKC", text or "")
+    text = text.translate(str.maketrans("", "", _INVISIBLE))
+    return re.sub(r"\s+", " ", text).strip()
+
+
+# Each pattern targets an attacker *instruction*, not a topic, so an ordinary
+# "summarise this transfer email" request does not match any of them.
+INJECTION_PATTERNS = [
+    re.compile(p, re.IGNORECASE)
+    for p in (
+        # 1. Override earlier rules: "ignore (all) previous/above/prior instructions|rules"
+        r"\b(ignore|disregard|forget|override|bypass)\b.{0,30}\b(previous|above|prior|earlier|all|your|the)\b.{0,20}\b(instructions?|rules?|guidelines?|prompts?|polic(y|ies))\b",
+        # 2. Role hijack: "you are now ...", "from now on you are"
+        r"\byou are now\b|\bfrom now on,? you (are|will|must)\b",
+        # 3. Probing the system prompt
+        r"\b(system|developer|hidden|initial) (prompt|instructions?|message)\b",
+        # 4. Asking the model to reveal its own instructions / secrets
+        r"\b(reveal|show|print|repeat|display|leak|output|tell me)\b.{0,25}\byour\b.{0,15}\b(instructions?|prompt|rules|configuration|secrets?)\b",
+        r"\b(reveal|disclose|leak|expose)\b.{0,30}\b(secrets?|password|credentials?|internal)\b",
+        # 5. Persona tricks: "pretend you are", "act as an unrestricted/jailbroken ..."
+        r"\bpretend (that )?(you are|to be|you're)\b",
+        r"\bact as (a |an )?(unrestricted|unfiltered|jailbroken|uncensored|evil|dan)\b",
+        # 6. Known jailbreak names / modes
+        r"\b(jailbreak|jailbroken|dan mode|developer mode|do anything now)\b",
+        # 7. Asking directly for credentials / internal infra
+        r"\b(admin(istrator)? password|api[ _-]?key|database (host|password|credentials?)|db[ _-]?host|connection string)\b",
+        # 7b. Credentials of a system, in either word order ("credentials used by the backend",
+        #     "the database password"); a customer's *own* "account password" is not matched.
+        r"\b(credentials?|passwords?|secrets?|tokens?)\b.{0,40}\b(database|backend|server|system|internal|admin|service)\b",
+        r"\b(database|backend|server|internal|admin|service)\b.{0,25}\b(credentials?|passwords?|secrets?|tokens?)\b",
+        # 7c. "Hypothetically / in a story ... give the secret": the framing trick
+        r"\b(hypothetical(ly)?|imagine|in a (story|poem|movie)|roleplay|role-play)\b.{0,80}\b(password|api[ _-]?key|secret|credentials?)\b",
+        # 8. Vietnamese equivalents
+        r"b[oỏ]\s*qua\s*(m[oọ]i\s*)?(h[uư][oớ]ng\s*d[aẫ]n|quy\s*t[aắ]c)|ti[eế]t\s*l[oộ]\s*(m[aậ]t\s*kh[aẩ]u|api|h[eệ]\s*th[oố]ng)",
+    )
+]
+
+
 def detect_injection(user_input: str) -> InputStatus:
     """Detect prompt injection patterns in user input.
 
@@ -51,14 +100,10 @@ def detect_injection(user_input: str) -> InputStatus:
     Returns:
         ``"BLOCK"`` if injection detected (chặn), ``"ALLOW"`` otherwise (cho qua).
     """
-    INJECTION_PATTERNS = [
-        # TODO: Add at least 5 regex patterns
-        # Example:
-        # r"ignore (all )?(previous|above) instructions",
-    ]
+    text = _normalize(user_input)
 
     for pattern in INJECTION_PATTERNS:
-        if re.search(pattern, user_input, re.IGNORECASE):
+        if pattern.search(text):
             return "BLOCK"
     return "ALLOW"
 
@@ -74,6 +119,36 @@ def detect_injection(user_input: str) -> InputStatus:
 # Return ``"ALLOW"`` if banking-related and OK.
 # ============================================================
 
+# The shared ALLOWED_TOPICS list lacks everyday banking words ("debit card", "mortgage",
+# "bank"), which would be false positives. Kept here so config.py stays untouched.
+EXTRA_BANKING_TOPICS = [
+    "bank", "card", "debit", "mortgage", "fee", "statement", "remittance",
+    "cheque", "check balance", "fund", "invest", "insur", "exchange rate",
+    # Vietnamese, written WITHOUT diacritics because input is folded before matching.
+    "the ghi no", "phi", "sao ke", "bao hiem", "ty gia", "dau tu",
+]
+
+
+def _fold(text: str) -> str:
+    """Lower-case, strip Vietnamese diacritics (``tài khoản`` -> ``tai khoan``)."""
+    text = _normalize(text).casefold().replace("đ", "d")
+    decomposed = unicodedata.normalize("NFD", text)
+    return "".join(c for c in decomposed if not unicodedata.combining(c))
+
+
+def _has_term(text: str, term: str) -> bool:
+    """Match ``term`` at a word start so "skilled" does not trigger "kill".
+
+    Words of 3 letters or fewer (``atm``, ``vay``) must match as a whole word,
+    otherwise they fire inside unrelated words ("atmosphere").
+    Longer terms may carry a suffix: ``loan`` matches "loans", ``hack`` matches "hacking".
+    """
+    pattern = r"\b" + re.escape(term)
+    if len(term) <= 3:
+        pattern += r"\b"
+    return re.search(pattern, text) is not None
+
+
 def topic_filter(user_input: str) -> InputStatus:
     """Decide whether the input is on-topic for VinBank.
 
@@ -84,14 +159,19 @@ def topic_filter(user_input: str) -> InputStatus:
         ``"BLOCK"`` = chặn (off-topic hoặc topic cấm).
         ``"ALLOW"`` = cho qua (câu banking hợp lệ).
     """
-    input_lower = user_input.lower()
+    text = _fold(user_input)
 
-    # TODO: Implement logic:
-    # 1. If input contains any blocked topic -> return "BLOCK"
-    # 2. If input doesn't contain any allowed topic -> return "BLOCK"
-    # 3. Otherwise -> return "ALLOW"
+    # 1. Any forbidden topic wins, even if a banking word is also present
+    #    ("how to hack a bank account" must not slip through on "bank account").
+    if any(_has_term(text, topic) for topic in BLOCKED_TOPICS):
+        return "BLOCK"
 
-    pass  # Replace with your implementation
+    # 2. Must mention at least one banking topic, otherwise it is off-topic.
+    if not any(_has_term(text, topic) for topic in ALLOWED_TOPICS + EXTRA_BANKING_TOPICS):
+        return "BLOCK"
+
+    # 3. On-topic and clean.
+    return "ALLOW"
 
 
 # ============================================================
@@ -144,14 +224,26 @@ class InputGuardrailPlugin(base_plugin.BasePlugin):
         self.total_count += 1
         text = self._extract_text(user_message)
 
-        # TODO: Implement logic:
-        # 1. Call detect_injection(text)
-        #    - If "BLOCK": increment blocked_count, return self._block_response("...")
-        # 2. Call topic_filter(text)
-        #    - If "BLOCK": increment blocked_count, return self._block_response("...")
-        # 3. If both return "ALLOW": return None (let message through)
+        # 1. Security check first: an attack gets the "security" refusal, not the
+        #    "off-topic" one, and the user learns nothing about which rule fired.
+        if detect_injection(text) == "BLOCK":
+            self.blocked_count += 1
+            return self._block_response(
+                "Request blocked: this message looks like an attempt to override "
+                "my instructions or access internal information. "
+                "I can only help with VinBank banking questions."
+            )
 
-        pass  # Replace with your implementation
+        # 2. Scope check: only banking topics are answered.
+        if topic_filter(text) == "BLOCK":
+            self.blocked_count += 1
+            return self._block_response(
+                "I can only help with VinBank banking questions such as accounts, "
+                "transfers, savings, loans and cards. How can I help with those?"
+            )
+
+        # 3. Both ALLOW -> return None so the message continues to the LLM.
+        return None
 
 
 # ============================================================
